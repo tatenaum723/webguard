@@ -47,11 +47,27 @@ webguard update-feeds                   # webguard-feeds.timer runs this daily
 - known-good → allowed (WebFetch only; a Bash command does more than fetch, so it falls
   through to normal permissions)
 - threat feed / DNS / deny-list hit → denied, with the reason returned to the model
-- unknown domain → asks, and is recorded as pending so it can also be approved from Signal
+- unknown domain → asks, and is recorded as pending so it can also be approved from Signal.
+  In `bypassPermissions` / `acceptEdits` mode nothing would prompt, so it is denied instead —
+  approve with `webguard allow <domain>`
 - localhost / LAN targets → ignored (Claude Code can reach them anyway)
 - guard failure → asks, never silently allows
 
+Two rules keep it from becoming friction:
+
+- only shell commands that actually reach the network are inspected (`curl`, `git`, `pip`, …),
+  so a URL inside an `echo`, a `grep` pattern or a commit message is ignored;
+- for shell commands, only real threat verdicts block. A malformed or unresolvable URL, or a
+  raw IP, is skipped rather than denied (WebFetch, where the URL is the point of the call,
+  still reports those).
+
 It checks the URL Claude asks for; redirects inside WebFetch aren't visible to the hook.
+WebSearch carries only a query, so it isn't filtered — but any URL Claude then fetches is.
+The hook constrains what gets fetched, not the agent: anything with shell access can run
+`webguard allow`. Claude should ask a person before approving a domain, not self-approve.
+
+`python3 manual_check.py` prints the decisions for a set of realistic cases against the live guard.
+
 Every decision is logged to `~/.local/state/webguard/hook.log`.
 
 ## Consumers

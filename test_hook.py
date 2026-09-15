@@ -18,6 +18,8 @@ class FakeGuard:
     def check(self, url):
         host = url.split("//", 1)[-1].split("/")[0].split(":")[0]
         domain = wg.registrable_domain(host)
+        if not host or "." not in host:
+            raise wg.Blocked("URL needs a public hostname")
         if host.replace(".", "").isdigit():
             raise wg.Blocked("raw IP addresses are not allowed; use a hostname")
         v = self.verdicts.get(domain, "allow")
@@ -65,6 +67,34 @@ class Extraction(unittest.TestCase):
     def test_no_double_count_bare_and_full(self):
         self.assertEqual(hook.urls_from("Bash", {"command": "curl https://ex.com/a"}), ["https://ex.com/a"])
 
+    def test_urls_that_are_not_fetches_are_ignored(self):
+        for cmd in ('echo "see https://example.com/docs"',
+                    'git commit -m "closes issue" -m "details"',
+                    "grep -r 'https://evil.com' .",
+                    'sed -i "s|https://old.com|https://new.com|" f.txt',
+                    "cat README.md | head -20",
+                    "python3 -c \"print('https://evil.com')\""):
+            self.assertEqual(hook.urls_from("Bash", {"command": cmd}), [], cmd)
+
+    def test_fetchers_inside_substitution(self):
+        self.assertEqual(hook.urls_from("Bash", {"command": 'x=$(curl -s https://a.com/j); echo "$x"'}),
+                         ["https://a.com/j"])
+
+    def test_package_managers(self):
+        self.assertEqual(hook.urls_from("Bash", {"command": "pip install https://files.pythonhosted.org/x.whl"}),
+                         ["https://files.pythonhosted.org/x.whl"])
+
+    def test_soft_failures_skipped_for_bash_only(self):
+        """A junk URL inside a fetching command (a heredoc, a template) shouldn't block the command."""
+        out, _ = run(bash("curl -s https:// | head"))
+        self.assertIsNone(out)
+        out, _ = run(webfetch("https://"))
+        self.assertEqual(out["permissionDecision"], "deny")
+
+    def test_threat_still_blocks_bash(self):
+        out, _ = run(bash("curl https:// ; curl https://evil.com/x"), {"evil.com": "block"})
+        self.assertEqual(out["permissionDecision"], "deny")
+
     def test_other_tools_ignored(self):
         self.assertEqual(hook.urls_from("Read", {"file_path": "https://x.com"}), [])
 
@@ -105,8 +135,16 @@ class Decisions(unittest.TestCase):
         out, _ = run(webfetch("http://127.0.0.1:30000/v1/models"))
         self.assertEqual(out["permissionDecision"], "allow")
 
-    def test_public_raw_ip_asks(self):
-        out, _ = run(bash("curl http://185.199.108.153/payload"))
+    def test_bypass_mode_denies_unknown(self):
+        out, _ = run(webfetch("https://tiny.dev/x", permission_mode="bypassPermissions"), {"tiny.dev": "pending"})
+        self.assertEqual(out["permissionDecision"], "deny")
+        self.assertIn("webguard allow tiny.dev", out["permissionDecisionReason"])
+        out, _ = run(webfetch("https://tiny.dev/x", permission_mode="default"), {"tiny.dev": "pending"})
+        self.assertEqual(out["permissionDecision"], "ask")
+
+    def test_public_raw_ip(self):
+        self.assertIsNone(run(bash("curl http://185.199.108.153/payload"))[0])   # shell: deliberate, falls through
+        out, _ = run(webfetch("http://185.199.108.153/payload"))
         self.assertEqual(out["permissionDecision"], "ask")
 
     def test_no_url_no_output(self):
