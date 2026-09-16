@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import time
 import unittest
+import unittest.mock
 import urllib.error
 import zipfile
 from email.message import Message
@@ -289,3 +290,86 @@ class DNSParse(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=1)
+
+
+class Download(Base):
+    def setUp(self):
+        super().setUp()
+        self.dest = os.path.join(self.tmp.name, "dl")
+
+    def op(self, body, ctype, headers=None):
+        r = Resp(body, ctype)
+        if headers:
+            r.headers.update(headers)
+        return FakeOpener({"https://python.org/f": r})
+
+    def test_saves_pdf_with_hash(self):
+        r = wg.download(self.g, "https://python.org/f", self.dest, opener=self.op(b"%PDF-1.7 data", "application/pdf"))
+        self.assertTrue(os.path.exists(r["path"]))
+        self.assertEqual(r["bytes"], 13)
+        self.assertEqual(len(r["sha256"]), 64)
+
+    def test_refuses_executables_and_unknown_types(self):
+        with self.assertRaises(wg.Blocked):
+            wg.download(self.g, "https://python.org/f", self.dest,
+                        opener=self.op(b"MZ", "application/x-msdownload"))
+        with self.assertRaises(wg.Blocked):   # right type, executable name
+            wg.download(self.g, "https://python.org/f", self.dest,
+                        opener=self.op(b"x", "application/zip"), name="payload.sh")
+
+    def test_size_cap_enforced_even_when_length_lies(self):
+        with self.assertRaises(wg.Blocked):
+            wg.download(self.g, "https://python.org/f", self.dest,
+                        opener=self.op(b"x" * 5000, "application/pdf"), max_bytes=1000)
+        self.assertEqual(os.listdir(self.dest), [])          # partial file cleaned up
+
+    def test_declared_length_rejected_early(self):
+        op = self.op(b"x", "application/pdf", {"Content-Length": "99999999"})
+        with self.assertRaises(wg.Blocked):
+            wg.download(self.g, "https://python.org/f", self.dest, opener=op, max_bytes=1000)
+
+    def test_names_cannot_escape_the_directory(self):
+        self.assertEqual(wg.safe_name("https://x.com/../../etc/passwd", "text/plain"), "passwd.txt")
+        self.assertEqual(wg.safe_name("https://x.com/a%2F..%2Fb.pdf", "application/pdf"), "a_.._b.pdf")
+        self.assertEqual(wg.safe_name("https://x.com/", "application/pdf"), "download.pdf")
+
+    def test_second_file_does_not_overwrite(self):
+        for _ in range(2):
+            r = wg.download(self.g, "https://python.org/f", self.dest, opener=self.op(b"a", "application/pdf"))
+        self.assertEqual(sorted(os.listdir(self.dest)), ["f-2.pdf", "f.pdf"])
+
+    def test_blocked_domain_never_downloads(self):
+        with self.assertRaises(wg.Blocked):
+            wg.download(self.g, "https://evil-wild.com/f", self.dest, opener=self.op(b"a", "application/pdf"))
+
+
+class Search(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.feeds = make_feeds(os.path.join(self.tmp.name, "f.db"), threats=[("bad-result.com", "hagezi-tif", 1)])
+        self.g = wg.WebGuard(os.path.join(self.tmp.name, "w.db"), None, feeds=self.feeds)
+        self.payload = {"results": [
+            {"title": "Good", "url": "https://good.org/a", "content": "snippet"},
+            {"title": "Bad", "url": "https://bad-result.com/x", "content": "malware"},
+            {"title": "Denied", "url": "https://pastebin.com/raw/x", "content": "paste"},
+            {"title": "Junk", "url": "", "content": "no url"},
+        ]}
+
+    def fake_urlopen(self, req, timeout=None):
+        self.asked = req.full_url
+        return Resp(json.dumps(self.payload), "application/json")
+
+    def test_filters_threats_and_denylist(self):
+        with unittest.mock.patch.object(wg.urllib.request, "urlopen", self.fake_urlopen):
+            results = wg.search("cissp study guide", guard=self.g)
+        self.assertEqual([r["url"] for r in results], ["https://good.org/a"])
+        self.assertIn("q=cissp+study+guide", self.asked)
+
+    def test_service_down_is_a_clear_error(self):
+        def boom(req, timeout=None):
+            raise wg.urllib.error.URLError("connection refused")
+        with unittest.mock.patch.object(wg.urllib.request, "urlopen", boom):
+            with self.assertRaises(wg.Blocked) as c:
+                wg.search("x", guard=self.g)
+        self.assertIn("searxng", str(c.exception))

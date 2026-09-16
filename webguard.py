@@ -34,6 +34,7 @@ bad inside its 30 days is still caught. Fetches are GET-only, size/time limited,
 text-only, and every redirect hop is re-checked. Fetched content is returned as
 text for the model and must be treated as untrusted input.
 """
+import hashlib
 import html.parser
 import http.client
 import ipaddress
@@ -56,7 +57,7 @@ import io
 STATE_DIR = os.path.expanduser(os.environ.get("WEBGUARD_STATE", "~/.local/state/webguard"))
 CONFIG_PATH = os.path.expanduser(os.environ.get("WEBGUARD_CONFIG", "~/.config/webguard/config.toml"))
 DEFAULTS = {"state_dir": STATE_DIR, "key_file": "~/.config/webguard/virustotal.key", "protective_dns": True,
-            "auto_allow_top": 20000, "deny": []}
+            "auto_allow_top": 20000, "deny": [], "search_url": "http://127.0.0.1:8888/search"}
 
 ALLOW_TTL = 30 * 86400
 BLOCK_TTL = 30 * 86400
@@ -421,6 +422,7 @@ class WebGuard:
         self.deny = set(DEFAULT_DENY) | set(deny or ())
         self.resolver = resolver
         self.feeds, self.dns, self.auto_allow_top = feeds, dns, auto_allow_top
+        self.search_url = SEARCH_URL
 
     def _get(self, domain):
         with self.lock:
@@ -586,18 +588,16 @@ def safe_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _SafeHTTPHandler, _SafeHTTPSHandler, _NoRedirect)
 
 
-def fetch(guard, url, opener=None):
-    """GET a URL through the guard. Every redirect hop is re-checked. Returns dict."""
-    opener = opener or safe_opener()
+def _open_checked(guard, url, opener, accept):
+    """GET a URL, re-checking the guard on every redirect hop. Returns (response, url, domain, hops)."""
     hops = []
     for _ in range(MAX_REDIRECTS + 1):
         url, host, domain, how = guard.check(url)
         hops.append(f"{domain} ({how})")
         req = urllib.request.Request(url, method="GET", headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) signal-bridge-webfetch/1.0",
-            "Accept": "text/html,text/plain,application/json;q=0.9,*/*;q=0.1"})
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) signal-bridge-webfetch/1.0", "Accept": accept})
         try:
-            resp = opener.open(req, timeout=TIMEOUT)
+            return opener.open(req, timeout=TIMEOUT), url, domain, hops
         except urllib.error.HTTPError as e:
             if e.code in (301, 302, 303, 307, 308) and e.headers.get("Location"):
                 url = urllib.parse.urljoin(url, e.headers["Location"])
@@ -608,21 +608,131 @@ def fetch(guard, url, opener=None):
             raise reason if isinstance(reason, Blocked) else Blocked(f"could not reach {host}: {reason}")
         except (OSError, http.client.HTTPException) as e:
             raise Blocked(f"could not reach {host}: {e.__class__.__name__}")
-        with resp:
-            ctype = (resp.headers.get("Content-Type") or "").lower()
-            if not ctype.startswith(TEXT_TYPES):
-                raise Blocked(f"refusing non-text content ({ctype or 'unknown type'})")
-            body = resp.read(MAX_BYTES + 1)
-        truncated = len(body) > MAX_BYTES
-        charset = (re.search(r"charset=([\w-]+)", ctype) or [None, "utf-8"])[1]
-        text = body[:MAX_BYTES].decode(charset, errors="replace")
-        if "html" in ctype:
-            text = html_to_text(text)
-        if len(text) > MAX_TEXT:
-            text, truncated = text[:MAX_TEXT], True
-        return {"url": url, "domain": domain, "hops": hops, "content_type": ctype.split(";")[0],
-                "truncated": truncated, "text": text}
     raise Blocked("too many redirects")
+
+
+def fetch(guard, url, opener=None):
+    """GET a URL through the guard and return its text. Every redirect hop is re-checked."""
+    opener = opener or safe_opener()
+    resp, url, domain, hops = _open_checked(guard, url, opener,
+                                            "text/html,text/plain,application/json;q=0.9,*/*;q=0.1")
+    with resp:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+        if not ctype.startswith(TEXT_TYPES):
+            raise Blocked(f"refusing non-text content ({ctype or 'unknown type'}); use a download instead")
+        body = resp.read(MAX_BYTES + 1)
+    truncated = len(body) > MAX_BYTES
+    charset = (re.search(r"charset=([\w-]+)", ctype) or [None, "utf-8"])[1]
+    text = body[:MAX_BYTES].decode(charset, errors="replace")
+    if "html" in ctype:
+        text = html_to_text(text)
+    if len(text) > MAX_TEXT:
+        text, truncated = text[:MAX_TEXT], True
+    return {"url": url, "domain": domain, "hops": hops, "content_type": ctype.split(";")[0],
+            "truncated": truncated, "text": text}
+
+
+# --------------------------------------------------------------------------- search
+SEARCH_URL = "http://127.0.0.1:8888/search"
+SEARCH_TIMEOUT = 20
+
+
+def search(query, limit=8, url=None, guard=None, timeout=SEARCH_TIMEOUT):
+    """Query the local SearXNG instance (no API key, queries stay on this box) and return
+    [{title, url, snippet}]. Results on the threat feeds or deny-list are dropped, so the
+    model is never handed a known-bad link to click. Not routed through the guard itself:
+    the search service is ours, on loopback."""
+    params = urllib.parse.urlencode({"q": query, "format": "json", "safesearch": "0"})
+    req = urllib.request.Request(f"{url or SEARCH_URL}?{params}",
+                                 headers={"Accept": "application/json", "User-Agent": "webguard-search/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.load(r)
+    except urllib.error.URLError as e:
+        raise Blocked(f"the local search service is not answering ({getattr(e, 'reason', e)}); "
+                      f"is the searxng container running?")
+    except (ValueError, TimeoutError) as e:
+        raise Blocked(f"search failed: {e.__class__.__name__}")
+    out = []
+    for r in data.get("results", []):
+        link = r.get("url") or ""
+        host = (urllib.parse.urlsplit(link).hostname or "").lower()
+        if not host:
+            continue
+        if guard:
+            domain = registrable_domain(host)
+            if domain in guard.deny or host in guard.deny:
+                continue
+            if guard.feeds and guard.feeds.threat(host):
+                continue
+        out.append({"title": (r.get("title") or "")[:200], "url": link,
+                    "snippet": (r.get("content") or "")[:300]})
+        if len(out) >= limit:
+            break
+    return out
+
+
+# --------------------------------------------------------------------------- downloads
+MAX_DOWNLOAD = 64 * 1024 * 1024
+DOWNLOAD_TYPES = {
+    "application/pdf": ".pdf", "application/epub+zip": ".epub", "application/zip": ".zip",
+    "application/json": ".json", "application/xml": ".xml", "text/plain": ".txt", "text/markdown": ".md",
+    "text/csv": ".csv", "text/html": ".html", "image/png": ".png", "image/jpeg": ".jpg", "image/gif": ".gif",
+    "image/webp": ".webp", "image/svg+xml": ".svg", "application/x-tar": ".tar", "application/gzip": ".gz",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document": ".docx",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation": ".pptx",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": ".xlsx",
+}
+# never saved, whatever the server calls them: things whose only purpose is to run
+BAD_SUFFIXES = (".exe", ".msi", ".dll", ".scr", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".jar", ".apk",
+                ".dmg", ".pkg", ".deb", ".rpm", ".appimage", ".so", ".bin", ".com", ".lnk", ".iso", ".sh")
+
+
+def safe_name(url, ctype, fallback="download"):
+    """A filename that can only ever land in the target directory."""
+    base = os.path.basename(urllib.parse.urlsplit(url).path) or fallback
+    base = re.sub(r"[^A-Za-z0-9._-]", "_", urllib.parse.unquote(base)).lstrip(".")[:120] or fallback
+    if "." not in base:
+        base += DOWNLOAD_TYPES.get(ctype.split(";")[0].strip(), "")
+    return base
+
+
+def download(guard, url, dest_dir, opener=None, max_bytes=MAX_DOWNLOAD, name=None):
+    """Save a file through the guard: same domain checks, type allowlist, size cap, no executables.
+    Files are only written to disk -- nothing here ever runs them."""
+    opener = opener or safe_opener()
+    resp, url, domain, hops = _open_checked(guard, url, opener, "*/*")
+    with resp:
+        ctype = (resp.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+        disp = resp.headers.get("Content-Disposition") or ""
+        if ctype and ctype not in DOWNLOAD_TYPES:
+            raise Blocked(f"refusing content type {ctype}")
+        declared = int(resp.headers.get("Content-Length") or 0)
+        if declared > max_bytes:
+            raise Blocked(f"file is {declared / 1e6:.1f} MB, over the {max_bytes / 1e6:.0f} MB limit")
+        named = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";]+)', disp)
+        fname = name or safe_name(named.group(1) if named else url, ctype)
+        if fname.lower().endswith(BAD_SUFFIXES):
+            raise Blocked(f"refusing to save an executable file ({fname})")
+        os.makedirs(dest_dir, exist_ok=True)
+        path = os.path.join(dest_dir, fname)
+        stem, ext = os.path.splitext(path)
+        n = 2
+        while os.path.exists(path):
+            path, n = f"{stem}-{n}{ext}", n + 1
+        digest = hashlib.sha256()
+        size = 0
+        with open(path, "wb") as f:
+            while chunk := resp.read(256 * 1024):
+                size += len(chunk)
+                if size > max_bytes:
+                    f.close()
+                    os.remove(path)
+                    raise Blocked(f"file is over the {max_bytes / 1e6:.0f} MB limit")
+                digest.update(chunk)
+                f.write(chunk)
+    return {"url": url, "domain": domain, "hops": hops, "path": path, "name": os.path.basename(path),
+            "bytes": size, "content_type": ctype, "sha256": digest.hexdigest()}
 
 
 def load_provider(key_path, state_dir):
@@ -659,8 +769,10 @@ def build(wcfg=None, log=lambda m: None):
     provider = load_provider(cfg["key_file"], state)
     feeds = ThreatFeeds(os.path.join(state, "feeds.db"), top_n=cfg["auto_allow_top"])
     dns = ProtectiveDNS() if cfg["protective_dns"] else None
-    return WebGuard(os.path.join(state, "web.db"), provider, deny=cfg["deny"], feeds=feeds, dns=dns,
-                    auto_allow_top=cfg["auto_allow_top"])
+    guard = WebGuard(os.path.join(state, "web.db"), provider, deny=cfg["deny"], feeds=feeds, dns=dns,
+                     auto_allow_top=cfg["auto_allow_top"])
+    guard.search_url = cfg.get("search_url", SEARCH_URL)
+    return guard
 
 
 def main(argv=None):
@@ -671,6 +783,11 @@ def main(argv=None):
     for name in ("check", "fetch"):
         sp = sub.add_parser(name)
         sp.add_argument("url")
+    sp = sub.add_parser("search")
+    sp.add_argument("query", nargs="+")
+    sp = sub.add_parser("download")
+    sp.add_argument("url")
+    sp.add_argument("--dir", default=".")
     for name in ("allow", "deny"):
         sp = sub.add_parser(name)
         sp.add_argument("domain")
@@ -712,6 +829,12 @@ def main(argv=None):
         g.set_domain(domain, "allow" if a.action == "allow" else "block", "owner",
                      f"{a.action}ed from the command line", ttl)
         print(f"{a.action}ed {domain}" + (f" for {a.days} days" if a.days else ""))
+    elif a.action == "search":
+        for r in search(" ".join(a.query), guard=g):
+            print(f"{r['title'][:70]}\n  {r['url']}\n  {r['snippet'][:120]}\n")
+    elif a.action == "download":
+        r = download(g, a.url, a.dir)
+        print(f"saved {r['path']} ({r['bytes'] / 1e6:.1f} MB, {r['content_type']}, sha256 {r['sha256'][:16]})")
     elif a.action == "check":
         try:
             print("ALLOW:", g.check(a.url)[3])

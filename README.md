@@ -30,6 +30,8 @@ top 20k are on HaGeZi's threat list, which is why popularity alone never allows 
 ```bash
 webguard check https://example.org/     # what would happen, and why
 webguard fetch https://example.org/     # fetch through the guard (text only, 2MB/15s caps)
+webguard search <words...>              # local SearXNG, known-bad results dropped
+webguard download <url> --dir DIR       # save a file (type allowlist, 64MB cap, never executed)
 webguard allow example.org [--days 30]  # or --days 0 for forever
 webguard deny  example.org
 webguard list [--pending]
@@ -39,6 +41,19 @@ webguard update-feeds                   # webguard-feeds.timer runs this daily
 
 `~/bin/webguard` wraps `webguard.py`; state lives in `~/.local/state/webguard`
 (`feeds.db` ~90 MB, `web.db`, `hook.log`), config in `~/.config/webguard/config.toml`.
+
+## Search and downloads
+
+`search()` queries a **local SearXNG** container (`127.0.0.1:8888`, `docker restart unless-stopped`), so
+there is no API key and queries stay on the box. Results whose host is on the threat feeds or deny-list
+are dropped before the model ever sees them. The search service is on loopback and is not itself routed
+through the guard; every URL the model then opens is.
+
+`download()` adds to the fetch rules: a content-type allowlist (PDF, EPUB, ZIP, images, office docs,
+text/data), a 64 MB cap enforced while streaming (a lying `Content-Length` doesn't help), filenames
+sanitised so they cannot escape the target directory, existing files never overwritten, and executables
+refused outright (`.exe`, `.sh`, `.jar`, …) whatever the server calls them. Files are written and hashed
+(sha256), never run.
 
 ## Claude Code hook
 
