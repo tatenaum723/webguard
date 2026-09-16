@@ -588,6 +588,27 @@ def safe_opener():
     return urllib.request.build_opener(urllib.request.ProxyHandler({}), _SafeHTTPHandler, _SafeHTTPSHandler, _NoRedirect)
 
 
+def _decompress(raw, encoding):
+    """Decompress a fetched body if the server gzip/deflate/br-encoded it (sites often do)."""
+    enc = (encoding or "").lower().strip()
+    try:
+        if enc == "gzip":
+            import gzip
+            return gzip.decompress(raw)
+        if enc == "deflate":
+            import zlib
+            try:
+                return zlib.decompress(raw)
+            except zlib.error:
+                return zlib.decompress(raw, -zlib.MAX_WBITS)
+        if enc == "br":
+            import brotli
+            return brotli.decompress(raw)
+    except Exception:
+        return raw          # if decompression fails, fall back to the raw bytes
+    return raw
+
+
 def _open_checked(guard, url, opener, accept):
     """GET a URL, re-checking the guard on every redirect hop. Returns (response, url, domain, hops)."""
     hops = []
@@ -595,7 +616,8 @@ def _open_checked(guard, url, opener, accept):
         url, host, domain, how = guard.check(url)
         hops.append(f"{domain} ({how})")
         req = urllib.request.Request(url, method="GET", headers={
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) signal-bridge-webfetch/1.0", "Accept": accept})
+            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) signal-bridge-webfetch/1.0", "Accept": accept,
+            "Accept-Encoding": "gzip, deflate"})
         try:
             return opener.open(req, timeout=TIMEOUT), url, domain, hops
         except urllib.error.HTTPError as e:
@@ -620,7 +642,8 @@ def fetch(guard, url, opener=None):
         ctype = (resp.headers.get("Content-Type") or "").lower()
         if not ctype.startswith(TEXT_TYPES):
             raise Blocked(f"refusing non-text content ({ctype or 'unknown type'}); use a download instead")
-        body = resp.read(MAX_BYTES + 1)
+        raw = resp.read(4 * MAX_BYTES + 1)                       # allow for compression
+        body = _decompress(raw, resp.headers.get("Content-Encoding"))
     truncated = len(body) > MAX_BYTES
     charset = (re.search(r"charset=([\w-]+)", ctype) or [None, "utf-8"])[1]
     text = body[:MAX_BYTES].decode(charset, errors="replace")
